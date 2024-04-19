@@ -6,25 +6,31 @@ import matplotlib.pyplot as plt
 def setup_logging(log_file_path):
 # 创建 logger
 logger = logging.getLogger('VehicleAnalysisLogger')
-logger.setLevel(logging.DEBUG) # 设置日志级别为DEBUG
+logger.setLevel(logging.DEBUG) # 设置日志级别为DEBUG 
 # 清除已有的处理器
 if logger.hasHandlers():
-logger.handlers.clear()
+logger.handlers.clear()  
+
 # 创建控制台处理器，并设置级别为DEBUG
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.DEBUG)
 console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 console_handler.setFormatter(console_formatter)
+ 
 # 创建文件处理器，并设置级别为DEBUG
 file_handler = logging.FileHandler(log_file_path, mode='a') # 使用追加模式
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter('%(message)s')
-file_handler.setFormatter(file_formatter)
+file_handler.setFormatter(file_formatter)  
+
 # 添加处理器到 logger
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
-  
+logger.setLevel(logging.DEBUG)
+
 return logger
+
+  
 
 def read_tracks_csv(file_path):
 data = pd.read_csv(file_path)
@@ -53,6 +59,7 @@ if min_value == float('inf'): # 如果没有更新最小值，返回None或适�
 min_value = None
 return "Pass", results, min_value # 确保返回三个值
 
+  
 def check_collision(tracks_data):
 x_diffs = []
 min_diff = float('inf')
@@ -68,7 +75,12 @@ if x_diff < 4.1:
 return "Fail", x_diffs, min_diff
 return "Pass", x_diffs, min_diff if min_diff != float('inf') else None
 
+  
+  
+  
+
 def process_folders(root_dir, logger):
+fail_files = []
 for subdir, dirs, files in os.walk(root_dir):
 folder_name = os.path.basename(subdir) # 获取当前文件夹名称
 for file in files:
@@ -76,21 +88,83 @@ if file.endswith("tracks.csv"):
 logger.info(f"Processing in folder: {folder_name}, file: {file}")
 file_path = os.path.join(subdir, file)
 tracks_data = read_tracks_csv(file_path)
+
+  
+
 rel_result, rel_data, min_thw = analyze_vehicle_relationship(tracks_data)
 if rel_result == "Fail":
 logger.info(f"{folder_name}/{file} - Vehicle relationship check failed. Checking for collisions.")
 coll_result, coll_data, min_x_diff = check_collision(tracks_data)
 if coll_result == "Fail":
+fail_files.append(file_path)
 logger.info(f"{folder_name}/{file} - Collision detected.")
 else:
 logger.info(f"{folder_name}/{file} - No collision detected. Minimum x difference is: {min_x_diff}")
 else:
 logger.info(f"{folder_name}/{file} - Vehicle relationship check passed. Minimum THW: {min_thw}")
 
+def identify_vehicles(tracks_by_frame_and_id):
+vehicle_first_appearance = {}
+
+cutting_in_ids = []
+
+ego_vehicle_ids = []
+
+  
+
+# 遍历所有帧
+
+for frame in sorted(tracks_by_frame_and_id.keys()):
+
+for vehicle_id, vehicle_data in tracks_by_frame_and_id[frame].items():
+
+# 记录车辆第一次出现的帧
+
+if vehicle_id not in vehicle_first_appearance:
+
+vehicle_first_appearance[vehicle_id] = (frame, vehicle_data['y'])
+
+  
+
+# 根据第一次出现的y值判断车辆类型
+
+for vehicle_id, (frame, y_position) in vehicle_first_appearance.items():
+
+if 55 <= y_position <= 57:
+
+cutting_in_ids.append(vehicle_id)
+
+elif 52 <= y_position <= 54:
+
+ego_vehicle_ids.append(vehicle_id)
+
+  
+
+# 准备返回结果
+
+result_list = []
+
+if cutting_in_ids:
+
+result_list.append(cutting_in_ids[0]) # 添加第一个切入车ID
+
+if ego_vehicle_ids:
+
+result_list.append(ego_vehicle_ids[-1]) # 添加最后一个本车ID
+
+  
+
+return result_list
+
   
   
+
 if __name__ == "__main__":
+
 root_dir = "/home/dji/disk1/zhouhang/shuju/AD4CHE_Release_20230116_V1_2/home/dji/AD4CHE/Aerial_Data/Highway_Scenario/AD4CHE_Release/Backup/AD4CHE_Release_20230116_V1.2/"
-log_file_path = "/home/dji/disk1/zhouhang/shuju/1.txt" 
+
+log_file_path = "/home/dji/disk1/zhouhang/shuju/1.txt" # 确保这个路径是正确的，并且脚本有权限写入
+
 logger = setup_logging(log_file_path)
+
 process_folders(root_dir, logger)
