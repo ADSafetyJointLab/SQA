@@ -1,0 +1,100 @@
+import pandas as pd
+import os
+
+def read_tracks_csv(file_path):
+    # 读取CSV文件并将数据组织成字典形式
+    data = pd.read_csv(file_path)
+    tracks_by_frame_and_id = {}
+    for frame, frame_data in data.groupby('frame'):
+        tracks_by_frame_and_id[frame] = {row['id']: row.to_dict() for _, row in frame_data.iterrows()}
+    return tracks_by_frame_and_id
+
+def identify_vehicles(tracks_by_frame_and_id):
+    for frame, vehicles in tracks_by_frame_and_id.items():
+        for vehicle_id, vehicle_data in vehicles.items():
+            # 检查该车辆是否有有效的thw值
+            if 'thw' in vehicle_data and vehicle_data['thw'] is not None:
+                # 本车已确定，尝试获取其precedingId作为切入车的ID
+                if 'precedingId' in vehicle_data and vehicle_data['precedingId'] is not None:
+                    cut_in_vehicle_id = vehicle_data['precedingId']
+                    # 检查切入车ID是否有效且存在于当前帧中
+                    if cut_in_vehicle_id in vehicles:
+                        # 检查切入车的 laneId 是否发生变化
+                        if has_lane_id_changed(cut_in_vehicle_id, tracks_by_frame_and_id):
+                            print(f"Ego Vehicle ID: {vehicle_id}, Cutting-in Vehicle ID: {cut_in_vehicle_id}")
+                            return cut_in_vehicle_id, vehicle_id  # 本车ID, 切入车ID
+                        else:
+                            print(f"Cutting-in vehicle {cut_in_vehicle_id} did not change lanes. Continuing search.")
+
+    print("No valid vehicle pairs found.")
+    return None, None
+
+def has_lane_id_changed(vehicle_id, tracks_by_frame_and_id):
+    last_lane_id = None
+    for frame, vehicles in sorted(tracks_by_frame_and_id.items()):
+        if vehicle_id in vehicles:
+            current_lane_id = vehicles[vehicle_id].get('laneId')
+            if last_lane_id is not None and current_lane_id != last_lane_id:
+                return True
+            last_lane_id = current_lane_id
+    return False
+
+def analyze_lane_change(tracks_by_frame_and_id, vehicle_ids, file_name, output_file):
+    # 分析切入车的 laneId 首次变化
+    cutting_in_id, _ = vehicle_ids
+    last_lane_id = None
+    first_change_frame = None
+
+    for frame in sorted(tracks_by_frame_and_id.keys()):
+        if cutting_in_id in tracks_by_frame_and_id[frame]:
+            current_lane_id = tracks_by_frame_and_id[frame][cutting_in_id].get('laneId')
+            if last_lane_id is None:
+                last_lane_id = current_lane_id
+            elif current_lane_id != last_lane_id:
+                first_change_frame = frame
+                break
+            last_lane_id = current_lane_id
+
+    with open(output_file, 'a') as file:
+        if first_change_frame:
+            file.write(f"{file_name}: Lane change for vehicle {cutting_in_id} first occurs at frame {first_change_frame}\n")
+        else:
+            file.write(f"{file_name}: No lane change detected for vehicle {cutting_in_id}\n")
+    
+        for frame in sorted(tracks_by_frame_and_id.keys()):
+            if cutting_in_id in tracks_by_frame_and_id[frame]:
+                if frame > first_change_frame:
+                    a = tracks_by_frame_and_id[first_change_frame+1][cutting_in_id]['ego_offset']
+                    b = tracks_by_frame_and_id[frame][cutting_in_id]['ego_offset']
+                    if 0.5 > (a - b) > 0.375:
+                        file.write(f"{file_name}: success {frame}\n")
+            
+
+
+def process_each_file(file_path, output_file):
+    # 处理每个文件
+    tracks_by_frame_and_id = read_tracks_csv(file_path)
+    vehicle_ids = identify_vehicles(tracks_by_frame_and_id)
+    if vehicle_ids:
+        analyze_lane_change(tracks_by_frame_and_id, vehicle_ids, os.path.basename(file_path), output_file)
+    else:
+        with open(output_file, 'a') as file:
+            file.write(f"{os.path.basename(file_path)}: No valid vehicle pairs found, skipped further analysis.\n")
+
+def main():
+    file_paths = [
+        "/home/dji/disk1/zhouhang/shuju/CUTIN19_40_15_0__9_16_fail_M3_tracks.csv",
+        "/home/dji/disk1/zhouhang/shuju/CUTIN33_40_5_0__7_23_fail_M3_tracks.csv",
+        "/home/dji/disk1/zhouhang/shuju/CUTIN68_60_35_0__7_18_fail_tracks.csv",
+        "/home/dji/disk1/zhouhang/shuju/CUTIN69_60_35_0__9_16_fail_tracks.csv",
+        "/home/dji/disk1/zhouhang/shuju/CUTIN82_70_45_0__7_14_fail_tracks.csv",
+        "/home/dji/disk1/zhouhang/shuju/CUTIN85_70_45_1_10_fail_M3_tracks.csv",
+        "/home/dji/disk1/zhouhang/shuju/CUTIN86_70_35_0__7_30_fail_tracks.csv"
+    ]
+    output_file = "/home/dji/disk1/zhouhang/shuju/step50427.txt"  # Set your output file path
+    open(output_file, 'w').close()  # Clear the output file initially
+    for file_path in file_paths:
+        process_each_file(file_path, output_file)
+
+if __name__ == "__main__":
+    main()
