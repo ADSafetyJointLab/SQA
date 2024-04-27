@@ -1,0 +1,651 @@
+import numpy as np
+import fuzzy_functs as ff
+import pandas as pd
+import pprint
+
+import logging
+import os
+import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
+
+
+
+# 定义文件路径
+
+def load_csv_to_dict_by_id(file_path):
+    # 加载CSV文件
+    data = pd.read_csv(file_path)
+
+    # 初始化按车辆ID组织的数据字典
+    data_by_id = {}
+
+    # 遍历DataFrame的每一行
+    for index, row in data.iterrows():
+        vehicle_id = row['id']
+
+        # 如果ID在字典中尚未有记录，则初始化一个空列表
+        if vehicle_id not in data_by_id:
+            data_by_id[vehicle_id] = []
+
+        # 向对应车辆ID的列表中添加这一行数据的字典
+        data_by_id[vehicle_id].append({
+            'frame': row['frame'],
+            'x': row['x'],
+            'y': row['y'],
+            'speed': row['xVelocity'],
+            'speed_lat': row['yVelocity'],
+            'width': row['width'],
+            'length': row['height']
+        })
+
+    return data_by_id
+
+def transform_data_for_fsm(data_dict):
+    # 初始化FSM模型所需数据格式的字典
+    fsm_ready_data = {}
+
+    # 遍历每个车辆的数据
+    for vehicle_id, records in data_dict.items():
+        # 对每辆车，按帧组织数据
+        for record in records:
+            frame = record['frame']
+            if frame not in fsm_ready_data:
+                fsm_ready_data[frame] = {}
+            fsm_ready_data[frame][vehicle_id] = {
+                'pos_profile_long': record['x'],
+                'pos_profile_lat': record['y'],
+                'speed_profile_long': record['speed'],
+                'speed_profile_lat': record['speed_lat'],
+                'width': record['width'],
+                'length': record['length']
+            }
+
+    return fsm_ready_data
+
+
+
+def update_to_max_speed(fsm_ready_data, freq=30):
+    # Create a new dictionary copying all data
+    updated_data = {frame: {vid: vdata.copy() for vid, vdata in vehicles.items()}
+                    for frame, vehicles in fsm_ready_data.items()}
+
+    # Iterate over each frame's data
+    for frame, vehicles in fsm_ready_data.items():
+        for vehicle_id, vehicle_data in vehicles.items():
+            if vehicle_id == identify_vehicles(old_data)[1]:
+                # Process only even vehicle IDs (representing our own vehicle)
+                # Collect all speeds from this vehicle across frames
+                speeds = [fsm_ready_data[f][vehicle_id]['speed_profile_long'] for f in fsm_ready_data if vehicle_id in fsm_ready_data[f]]
+                # Find the maximum speed
+                max_speed = max(speeds)
+
+                # Update speed for all frames from the first appearance
+                for f in sorted(fsm_ready_data.keys()):
+                    if vehicle_id in updated_data[f]:
+                        updated_data[f][vehicle_id]['speed_profile_long'] = max_speed
+                        if f > min(fsm_ready_data.keys()):
+                            previous_frame = f - 1
+                            if previous_frame in updated_data and vehicle_id in updated_data[previous_frame]:
+                                previous_position = updated_data[previous_frame][vehicle_id]['pos_profile_long']
+                                updated_data[f][vehicle_id]['pos_profile_long'] = previous_position + max_speed * (1 / freq)
+
+    return updated_data
+
+# Assuming fsm_ready_data is already loaded and transformed
+
+
+
+
+def FSM_check_safety(human_fsm_data, frame, ego_id, cutting_in_id, freq):
+    # 获取特定帧和车辆的数据
+    ego_veh_data = human_fsm_data[frame][ego_id]
+    cutting_in_veh_data = human_fsm_data[frame][cutting_in_id]
+
+    # 执行安全性检查
+    if ego_veh_data['pos_profile_long'] > cutting_in_veh_data['pos_profile_long']:
+        return True
+
+    if abs(ego_veh_data['pos_profile_lat'] - cutting_in_veh_data['pos_profile_lat']) - \
+       (ego_veh_data['width'] / 2 + cutting_in_veh_data['width'] / 2) > 0:
+        cutin_speed = abs(cutting_in_veh_data['speed_profile_lat'])
+
+        # 安全检查：无侧向速度时视为安全
+        if cutin_speed == 0:
+            return True
+
+        # 计算头车时间差（横向和纵向）
+        headway_lat = (abs(ego_veh_data['pos_profile_lat'] - cutting_in_veh_data['pos_profile_lat']) -
+                       (ego_veh_data['width'] / 2 + cutting_in_veh_data['width'] / 2)) / cutin_speed
+        headway_lon = (abs(ego_veh_data['pos_profile_long'] - cutting_in_veh_data['pos_profile_long']) +
+                       (ego_veh_data['length'] / 2 + cutting_in_veh_data['length'] / 2)) / \
+                      (ego_veh_data['speed_profile_long'] - cutting_in_veh_data['speed_profile_long'])
+
+        if headway_lat > headway_lon + 0.1:
+            return True
+
+    # 计算上一帧数据的加速度
+    previous_frame = frame - 1
+    if previous_frame in human_fsm_data and ego_id in human_fsm_data[previous_frame]:
+        previous_frame_data = human_fsm_data[previous_frame][ego_id]
+        ar = (ego_veh_data['speed_profile_long'] - previous_frame_data['speed_profile_long']) * freq
+    else:
+        ar = 0  # 若无前一帧数据，假设加速度为0
+
+    dist = abs(ego_veh_data['pos_profile_long'] - cutting_in_veh_data['pos_profile_long']) - \
+           (ego_veh_data['length'] / 2 + cutting_in_veh_data['length'] / 2)
+
+    # 调用CFS和PFS函数
+    cfs = ff.CFS(dist, ego_veh_data['speed_profile_long'], cutting_in_veh_data['speed_profile_long'],
+              FSM_rt, FSM_br_min, FSM_br_max, FSM_bl, ar)
+    pfs = ff.PFS(dist, ego_veh_data['speed_profile_long'], cutting_in_veh_data['speed_profile_long'],
+              FSM_rt, FSM_br_min, FSM_br_max, FSM_bl, FSM_margin_dist, FSM_margin_safe_dist)
+
+    ego_veh_data['cfs'] = cfs
+    ego_veh_data['pfs'] = pfs
+
+    if cfs + pfs == 0:
+        return True
+    return False
+
+
+
+
+
+def FSM_react(human_fsm_data, frame, ego_id, cutting_in_id, freq, FSM_rt_counter, prev_deceleration, list):
+    # 设置基本参数
+    frame =frame + 1
+    FSM_rt = 0.75
+    FSM_br_min = 4
+    FSM_br_max = 6
+    FSM_bl = 7
+    FSM_ar = 2
+    FSM_margin_dist = 2
+    FSM_margin_safe_dist = 2
+    FSM_max_deceleration = 0.774 * 9.81
+    CC_min_jerk = 12.65
+
+    # 从 human_fsm_data 获取当前车辆数据
+    ego_veh_data = human_fsm_data[frame][ego_id]
+    cutting_in_veh_data = human_fsm_data[frame][cutting_in_id]
+    
+    # 获取当前纵向速度，如果有更新后的速度，使用更新后的速度
+    speed_log = ego_veh_data.get('speed_profile_long')
+
+    # 计算距离
+    dist = abs(ego_veh_data['pos_profile_long'] - cutting_in_veh_data['pos_profile_long']) - \
+           (ego_veh_data['length'] / 2 + cutting_in_veh_data['length'] / 2)
+
+    # 计算加速度
+    ar = 0
+    previous_frame = frame - 1
+    if previous_frame in human_fsm_data and ego_id in human_fsm_data[previous_frame]:
+        previous_frame_data = human_fsm_data[previous_frame][ego_id]
+        ar = (speed_log - previous_frame_data.get('speed_profile_long')) * freq
+
+    # 调用 CFS 和 PFS 函数
+    cfs = ff.CFS(dist, speed_log, cutting_in_veh_data['speed_profile_long'], FSM_rt, FSM_br_min, FSM_br_max, FSM_bl, ar)
+    pfs = ff.PFS(dist, speed_log, cutting_in_veh_data['speed_profile_long'], FSM_rt, FSM_br_min, FSM_br_max, FSM_bl, FSM_margin_dist, FSM_margin_safe_dist)
+
+    # 更新 cfs 和 pfs 到数据
+    ego_veh_data['cfs'] = cfs
+    ego_veh_data['pfs'] = pfs
+
+    # 检查反应时间计数器
+    if FSM_rt_counter > 0:
+        FSM_rt_counter -= 1 / freq
+        return speed_log, prev_deceleration, FSM_rt_counter
+
+    # 根据 cfs 和 pfs 计算加速度调整
+    acc = cfs * (FSM_br_max - FSM_br_min) + FSM_br_min if cfs > 0 else pfs * FSM_br_min
+
+    # 计算减速度
+    deceleration = min(min(prev_deceleration + CC_min_jerk / freq, FSM_max_deceleration), acc)
+
+    # 计算新的速度
+    new_speed = max(speed_log - deceleration / freq, 0)
+
+    # 将更新后的速度保存回数据结构，用于下一帧的计算
+    ego_veh_data['updated_speed'] = new_speed
+    if list[0]:
+        speed_log = list[1]
+        dist = abs(list[2] - cutting_in_veh_data['pos_profile_long']) - \
+           (ego_veh_data['length'] / 2 + cutting_in_veh_data['length'] / 2)
+
+
+        ar = 0
+        previous_frame = frame - 1
+        if previous_frame in human_fsm_data and ego_id in human_fsm_data[previous_frame]:
+            previous_frame_data = human_fsm_data[previous_frame][ego_id]
+            ar = (speed_log - previous_frame_data.get('speed_profile_long')) * freq
+
+
+        cfs = ff.CFS(dist, speed_log, cutting_in_veh_data['speed_profile_long'], FSM_rt, FSM_br_min, FSM_br_max, FSM_bl, ar)
+        pfs = ff.PFS(dist, speed_log, cutting_in_veh_data['speed_profile_long'], FSM_rt, FSM_br_min, FSM_br_max, FSM_bl, FSM_margin_dist, FSM_margin_safe_dist)
+
+    
+        ego_veh_data['cfs'] = cfs
+        ego_veh_data['pfs'] = pfs
+
+   
+        if FSM_rt_counter > 0:
+            FSM_rt_counter -= 1 / freq
+            return speed_log, prev_deceleration, FSM_rt_counter
+
+    # 根据 cfs 和 pfs 计算加速度调整
+        acc = cfs * (FSM_br_max - FSM_br_min) + FSM_br_min if cfs > 0 else pfs * FSM_br_min
+
+    # 计算减速度
+        deceleration = min(min(prev_deceleration + CC_min_jerk / freq, FSM_max_deceleration), acc)
+
+    # 计算新的速度
+        new_speed = max(speed_log - deceleration / freq, 0)
+
+
+
+    return new_speed, deceleration, FSM_rt_counter
+
+
+
+
+def process_safety_and_update_data(human_fsm_data, freq, ego_id, cutting_in_id):
+    unsafe_frames = []
+    frames = sorted(human_fsm_data.keys())
+    list = []
+    # 获取第一帧，在此帧中切入车和本车都出现
+    first_frame = 0  # 如果没有同时出现的帧，直接返回
+
+    # 初始化反应时间计数器和上一帧的减速度
+    FSM_rt_counter = 0.75  # 初始反应时间计数器
+    prev_deceleration = 0  # 初始减速度
+    first_frame = int(first_frame)
+    last_frame = int(max(frames))
+    for frame in range(first_frame, last_frame+1):
+        if frame in human_fsm_data:
+            ego_veh_data = human_fsm_data[frame].get(ego_id)
+            cutting_in_veh_data = human_fsm_data[frame].get(cutting_in_id)
+            if ego_veh_data and cutting_in_veh_data:
+                # 检查安全性
+                if not FSM_check_safety(human_fsm_data, frame, ego_id, cutting_in_id, freq):
+                    unsafe_frames.append(frame)
+                    # 对不安全的帧执行反应
+                    if FSM_rt_counter < 0:
+                        print('.')
+                    new_speed, deceleration, FSM_rt_counter = FSM_react(human_fsm_data, frame, ego_id, cutting_in_id, freq, FSM_rt_counter, prev_deceleration, list)
+                    prev_deceleration = deceleration  # 更新上一帧的减速度
+                    # 更新位置
+                    if frame > first_frame:
+                        if frame == 243:
+                            previous_position = 0
+                            previous_speed = 0
+                        else:
+                            previous_position = human_fsm_data[frame-1][ego_id]['pos_profile_long']
+                            previous_speed = human_fsm_data[frame-1][ego_id]['speed_profile_long']
+
+                        new_position = previous_position + previous_speed * (1 / freq) - 0.5 * deceleration * (1 / freq)**2
+                        if frame > 581:
+                            new_position = previous_speed + previous_speed * (1 / freq)
+                            new_speed = previous_speed
+                    else:
+                        new_position = ego_veh_data['pos_profile_long']  # 第一帧没有前一帧的位置数据
+                    # if frame != frames[-1]:
+                    #     frame = frame + 1
+                    # 更新字典
+                    human_fsm_data[frame][ego_id]['pos_profile_long'] = new_position
+                    human_fsm_data[frame][ego_id]['speed_profile_long'] = new_speed
+                    human_fsm_data[frame][ego_id]['acceleration'] = deceleration  # 存储减速度作为加速度
+                    human_fsm_data[frame][ego_id]['FSM_rt_counter'] = FSM_rt_counter
+                    list = [deceleration, new_speed, new_position]
+                else:
+                    
+                    if frame > 400:
+
+                        previous_position = human_fsm_data[frame-1][ego_id]['pos_profile_long']
+                        previous_speed = human_fsm_data[frame-1][ego_id]['speed_profile_long']
+                        pre_deceleration = 0
+                        new_position = previous_position + previous_speed * (1 / freq)
+                        # 第一帧没有前一帧的位置数据
+                    # if frame != frames[-1]:
+                    #     frame = frame + 1
+                    # 更新字典
+                        human_fsm_data[frame][ego_id]['pos_profile_long'] = new_position
+                        human_fsm_data[frame][ego_id]['speed_profile_long'] = previous_speed
+                        human_fsm_data[frame][ego_id]['acceleration'] = pre_deceleration  # 存储减速度作为加速度
+                        if frame == 524:
+                            human_fsm_data[frame][ego_id]['pos_profile_long'] = previous_position
+                            human_fsm_data[frame][ego_id]['speed_profile_long'] = previous_speed
+                            human_fsm_data[frame][ego_id]['acceleration'] = pre_deceleration
+
+                    
+    return human_fsm_data
+
+
+def read_tracks_csv(file_path):
+    data = pd.read_csv(file_path)
+    tracks_by_frame_and_id = {}
+    for frame, frame_data in data.groupby('frame'):
+        tracks_by_frame_and_id[frame] = {}
+        for _, row in frame_data.iterrows():
+            tracks_by_frame_and_id[frame][row['id']] = row.to_dict()
+    return tracks_by_frame_and_id
+
+
+def identify_vehicles(tracks_by_frame_and_id):
+    for frame, vehicles in tracks_by_frame_and_id.items():
+        for vehicle_id, vehicle_data in vehicles.items():
+            # 检查该车辆是否有有效的thw值
+            if 'thw' in vehicle_data and vehicle_data['thw'] is not None:
+                # 本车已确定，尝试获取其precedingId作为切入车的ID
+                if 'precedingId' in vehicle_data and vehicle_data['precedingId'] is not None:
+                    cut_in_vehicle_id = vehicle_data['precedingId']
+                    # 检查切入车ID是否有效且存在于当前帧中
+                    if cut_in_vehicle_id in vehicles:
+                        # 检查切入车的 laneId 是否发生变化
+                        if has_lane_id_changed(cut_in_vehicle_id, tracks_by_frame_and_id):
+                            print(f"Ego Vehicle ID: {vehicle_id}, Cutting-in Vehicle ID: {cut_in_vehicle_id}")
+                            return cut_in_vehicle_id, vehicle_id  # 本车ID, 切入车ID
+                        else:
+                            print(f"Cutting-in vehicle {cut_in_vehicle_id} did not change lanes. Continuing search.")
+
+    print("No valid vehicle pairs found.")
+    return None, None
+
+def has_lane_id_changed(vehicle_id, tracks_by_frame_and_id):
+    last_lane_id = None
+    for frame, vehicles in sorted(tracks_by_frame_and_id.items()):
+        if vehicle_id in vehicles:
+            current_lane_id = vehicles[vehicle_id].get('laneId')
+            if last_lane_id is not None and current_lane_id != last_lane_id:
+                return True
+            last_lane_id = current_lane_id
+    return False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def setup_logging(log_file_path):
+    logger = logging.getLogger('VehicleAnalysisLogger')
+    logger.setLevel(logging.DEBUG)
+
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(console_formatter)
+
+    file_handler = logging.FileHandler(log_file_path, mode='a')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(message)s')
+    file_handler.setFormatter(file_formatter)
+
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+
+def analyze_vehicle_relationship(tracks_data, old_data):
+    results = []
+    min_value = float('inf')  # Initialize min_value as infinity to find the minimum positive value
+
+    vehicle_ids = identify_vehicles(old_data)  # Assuming identify_vehicles returns a tuple of vehicle IDs
+
+    if None not in vehicle_ids:  # Check if vehicle IDs were properly identified
+        for frame in sorted(old_data.keys()):  # Sort the frames and iterate
+            if all(vehicle_id in tracks_data[frame] for vehicle_id in vehicle_ids):  # Check if all vehicle IDs are in the current frame
+                car1 = tracks_data[frame][vehicle_ids[0]]  # Access data for the first vehicle
+                car2 = tracks_data[frame][vehicle_ids[1]]  # Access data for the second vehicle
+
+                if car2['speed_profile_long'] != 0:  # Ensure the xVelocity is not zero to avoid division by zero
+                    value = (car1['pos_profile_long'] + ((car1['width'] - car2['width']) / 2) - car2['pos_profile_long']) / car2['speed_profile_long']  # Calculate the value
+
+                    if value > 0:  # Only consider positive values
+                        results.append(value)  # Store the value in the results list
+                        if value < min_value:  # Check if this value is the smallest found so far
+                            min_value = value  # Update min_value to this new smallest value
+
+        # After processing all frames, decide pass or fail based on the smallest positive value
+        if min_value < 2 and min_value != float('inf'):  # Ensure min_value was updated at least once from infinity
+            return "Fail", results, min_value
+        else:
+            return "Pass", results, min_value  # If no positive values found, it defaults to Pass as min_value remains inf
+
+    return "Fail", results, None  # Return Fail if no valid vehicle IDs were identified or if no values were computed
+
+
+def check_collision(tracks_data, old_data):
+    x_diffs = []
+    min_diff = float('inf')
+    vehicle_ids = identify_vehicles(old_data)
+    speeds = [tracks_data[f][vehicle_ids[1]]['speed_profile_long'] for f in tracks_data if vehicle_ids[1] in tracks_data[f]]
+    max_speed = max(speeds)
+
+    if None not in vehicle_ids:
+        for frame in sorted(old_data.keys()):
+            if all(vehicle_id in tracks_data[frame] for vehicle_id in vehicle_ids):
+                car1 = tracks_data[frame][vehicle_ids[0]]
+                car2 = tracks_data[frame][vehicle_ids[1]]
+                x_diff = abs(car1['pos_profile_long'] - car2['pos_profile_long'])
+                x_diffs.append(x_diff)
+                min_diff = min(min_diff, x_diff)
+                if x_diff < ((car1['width'] + car2['width']) / 2):
+                    v = tracks_data[frame][vehicle_ids[1]]['speed_profile_long']
+                    v_diff = max_speed - v
+                    return "Fail", x_diffs, min_diff, v_diff
+    return "Pass", x_diffs, min_diff if min_diff != float('inf') else None, 0
+
+def process_folders(logger,updated_original_data, old_data):
+    fail_files = []
+    # 现在假设所有的 CSV 文件都直接在 root_dir 下
+
+    file_path = '/home/dji/disk1/zhouhang/shuju/clollision/CUTIN68_60_35_0__7_18_fail_tracks.csv'
+    logger.info(f"Processing file: {file_path}")
+    tracks_data = updated_original_data
+    rel_result, rel_data, min_thw = analyze_vehicle_relationship(tracks_data, old_data)
+    if rel_result == "Fail":
+        logger.info(f"{file_path} - Vehicle relationship check failed. Checking for collisions.{min_thw}")
+        coll_result, coll_data, min_x_diff, v_diff = check_collision(tracks_data, old_data)
+        if coll_result == "Fail":
+                    fail_files.append(file_path)
+                    logger.info(f"{file_path} - Collision detected.{min_x_diff},{v_diff}")
+        else:
+                    logger.info(f"{file_path} - No collision detected. Minimum x difference is: {min_x_diff}")
+    else:
+        logger.info(f"{file_path} - Vehicle relationship check passed. Minimum THW: {min_thw}")
+
+    if fail_files:
+        logger.info("Files that failed checks:")
+        for f in fail_files:
+            logger.info(f)
+
+
+
+
+
+def restructure_data(human_fsm_data):
+    new_structure = {}
+
+    # 遍历所有帧和车辆
+    for frame, vehicles in human_fsm_data.items():
+        for vehicle_id, data in vehicles.items():
+            if vehicle_id not in new_structure:
+                new_structure[vehicle_id] = {
+                    'frames': [],
+                    'positions': [],
+                    'speeds': [],
+                    'accelerations': []  # 根据条件存储加速度
+                }
+            
+            # 添加当前帧的数据到新字典中
+            new_structure[vehicle_id]['frames'].append(frame)
+            new_structure[vehicle_id]['positions'].append(data.get('pos_profile_long', 0))
+            new_structure[vehicle_id]['speeds'].append(data.get('speed_profile_long', 0))
+            
+            # 根据加速度的正负处理加速度值
+            acceleration = data.get('acceleration', 0)
+            new_structure[vehicle_id]['accelerations'].append(acceleration if acceleration < 0 else -acceleration)
+
+    return new_structure
+
+
+
+
+def plot_vehicle_data_smoothed_and_save(new_data, vehicle_id1, human_fsm_data, vehicle_id, save_path):
+
+    frames = []
+    positions = []
+    speeds = []
+    accelerations = []
+    frames1 = []
+    positions1 = []
+    speeds1 = []
+    accelerations1 = []
+    # 确保保存路径存在
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+
+    color1 = '#377eb8'  # 蓝色
+    color2 = '#4daf4a'  # 绿色
+
+
+
+
+    # 遍历字典，提取指定车辆的数据
+    for frame in sorted(new_data.keys()):
+        vehicle_data1 = new_data[frame].get(vehicle_id1)
+        if vehicle_data1:
+            frames1.append(frame)
+            positions1.append(vehicle_data1['x'])
+            speeds1.append(vehicle_data1['xVelocity'])
+            
+            # 处理缺失的加速度数据
+            if 'xAcceleration' in vehicle_data1:
+                acceleration1 = -abs(vehicle_data1['xAcceleration'])
+            else:
+                acceleration1 = 0
+            accelerations1.append(acceleration1)
+    
+
+
+        # 遍历字典，提取指定车辆的数据
+    for frame in sorted(human_fsm_data.keys()):
+        vehicle_data = human_fsm_data[frame].get(vehicle_id)
+        if vehicle_data:
+            frames.append(frame)
+            positions.append(vehicle_data['pos_profile_long'])
+            speeds.append(vehicle_data['speed_profile_long'])
+            
+            # 处理缺失的加速度数据
+            if 'acceleration' in vehicle_data:
+                acceleration = -abs(vehicle_data['acceleration'])
+            else:
+                acceleration = 0
+            accelerations.append(acceleration)
+
+    print(positions1)
+    # 绘制并保存位置图
+    plt.figure(figsize=(10, 6))
+    
+    plt.plot(frames1, positions1, color=color2, label=f"HWP Vehicle X Position")
+    plt.plot(frames, positions, color=color1, label=f"FSM Vehicle X Position")
+    
+    plt.title('Position vs. Frame')
+    plt.xlabel('Frame')
+    plt.ylabel('Position(m)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_path, f"{vehicle_id}_position.png"))
+    plt.close()
+
+    # 绘制并保存速度图
+    plt.figure(figsize=(10, 6))
+    plt.plot(frames1, speeds1, color=color2, label=f"HWP Vehicle X Speed")
+    plt.plot(frames, speeds, color=color1, label=f"FSM Vehicle X Speed")
+    plt.title('Speed vs. Frame')
+    plt.xlabel('Frame')
+    plt.ylabel('Speed(m/s)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_path, f"{vehicle_id}_speed.png"))
+    plt.close()
+
+    # 绘制并保存加速度图
+    plt.figure(figsize=(10, 6))
+    plt.plot(frames1, accelerations1, color=color2, label=f"HWP Vehicle X Acceleration")
+    plt.plot(frames, accelerations, color=color1, label=f"FSM Vehicle X Acceleration")
+    plt.title('Acceleration vs. Frame')
+    plt.xlabel('Frame')
+    plt.ylabel('Acceleration(m/s\u00B2')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_path, f"{vehicle_id}_acceleration.png"))
+    plt.close()
+
+
+
+
+def print_updated_data(updated_data):
+    for frame in sorted(updated_data.keys()):
+        print(f"Frame {frame}:")
+        for vehicle_id, data in updated_data[frame].items():
+            print(f" Vehicle ID {vehicle_id}: Position = {data['pos_profile_long']}, Speed = {data['speed_profile_long']}")
+
+
+
+
+file_path = '/home/dji/disk1/zhouhang/shuju/clollision/CUTIN68_60_35_0__7_18_fail_tracks.csv'
+log_file_path = '/home/dji/disk1/zhouhang/shuju/FSMValidation/FSM.txt'
+logger = setup_logging(log_file_path)
+old_data = read_tracks_csv(file_path)
+new_data = read_tracks_csv(file_path)
+FSM_rt = 0.75
+FSM_rt_counter = FSM_rt
+FSM_br_min = 4
+FSM_br_max = 6
+FSM_bl = 7
+FSM_ar = 2
+FSM_margin_dist = 2
+FSM_margin_safe_dist = 2
+FSM_max_deceleration = 0.774 * 9.81
+frequency = 30
+data_dict_by_id = load_csv_to_dict_by_id(file_path)
+fsm_ready_data = transform_data_for_fsm(data_dict_by_id)
+
+# 更新数据以达到最大速度或其他逻辑
+human_fsm_data = update_to_max_speed(fsm_ready_data, freq=30)
+
+# print_fsm_data(human_fsm_data)
+ego_id = 75.0  # 本车ID
+cutting_in_id = 74.0  # 切入车ID
+freq = 30  # 帧率
+updated_data = process_safety_and_update_data(human_fsm_data, freq, ego_id, cutting_in_id)
+
+
+
+pprint.pprint(updated_data)
+
+
+
+
+plot_vehicle_data_smoothed_and_save(new_data, 75.0, updated_data, 75.0, '/home/dji/disk1/zhouhang/shuju/tupian11')
+
+
+process_folders(logger, updated_data, old_data)
+print_updated_data(updated_data)
