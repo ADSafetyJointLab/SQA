@@ -1,0 +1,115 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
+import os
+
+def find_half_width_proximity_frame(tracks_by_frame_and_id, vehicle_ids, output_file):
+    cutting_in_id, ego_vehicle_id = vehicle_ids
+    frame_data = {
+        'frame': [],
+        'x_distance': [],
+        'ego_velocity': []
+    }
+
+    # 获取切入车和本车的宽度
+    cutting_in_width = next((tracks_by_frame_and_id[frame][cutting_in_id]['width'] for frame in tracks_by_frame_and_id if cutting_in_id in tracks_by_frame_and_id[frame]), None)
+    ego_vehicle_width = next((tracks_by_frame_and_id[frame][ego_vehicle_id]['width'] for frame in tracks_by_frame_and_id if ego_vehicle_id in tracks_by_frame_and_id[frame]), None)
+    if not cutting_in_width or not ego_vehicle_width:
+        print("Width data missing for one or both vehicles.")
+        return
+
+    half_total_width = (cutting_in_width + ego_vehicle_width) / 2
+
+    # 遍历每一帧来计算两车的x距离和本车的速度
+    for frame in tracks_by_frame_and_id:
+        if cutting_in_id in tracks_by_frame_and_id[frame] and ego_vehicle_id in tracks_by_frame_and_id[frame]:
+            x_distance = abs(tracks_by_frame_and_id[frame][cutting_in_id]['x'] - tracks_by_frame_and_id[frame][ego_vehicle_id]['x'])
+            ego_velocity = tracks_by_frame_and_id[frame][ego_vehicle_id]['xVelocity']
+            frame_data['frame'].append(frame)
+            frame_data['x_distance'].append(x_distance)
+            frame_data['ego_velocity'].append(ego_velocity)
+
+    # 找到x距离首次达到或低于宽度和的一半的帧
+    for index, x_dist in enumerate(frame_data['x_distance']):
+        if x_dist <= half_total_width:
+            frame = frame_data['frame'][index]
+            ego_velocity_at_frame = frame_data['ego_velocity'][index]
+            max_ego_velocity = max(frame_data['ego_velocity'])
+            speed_difference = abs(max_ego_velocity - ego_velocity_at_frame)
+
+            result = f"First frame where x distance <= half total width: {frame}\n" \
+                     f"Ego vehicle speed at this frame: {ego_velocity_at_frame}\n" \
+                     f"Maximum speed of ego vehicle: {max_ego_velocity}\n" \
+                     f"Difference between max speed and speed at this frame: {speed_difference}\n"
+
+            with open(output_file, 'a') as file:
+                file.write(result)
+            return  # Stop after finding the first occurrence
+
+    # 如果没有找到符合条件的帧，记录信息
+    with open(output_file, 'a') as file:
+        file.write("No frame found where x distance is less than or equal to half the width sum.\n")
+
+
+
+def identify_vehicles(tracks_by_frame_and_id):
+    all_ids = set()
+    for frame_data in tracks_by_frame_and_id.values():
+        all_ids.update(frame_data.keys())
+
+    id_frame_presence = {vehicle_id: [] for vehicle_id in all_ids}
+    for frame, vehicles in tracks_by_frame_and_id.items():
+        for vehicle_id, vehicle_data in vehicles.items():
+            id_frame_presence[vehicle_id].append((frame, vehicle_data['x'], vehicle_data['y']))
+
+    for vehicle1_id, vehicle1_data in id_frame_presence.items():
+        for vehicle2_id, vehicle2_data in id_frame_presence.items():
+            if vehicle1_id != vehicle2_id:
+                vehicle1_first_frame, vehicle1_first_x, vehicle1_first_y = min(vehicle1_data)
+                vehicle2_first_frame, vehicle2_first_x, vehicle2_first_y = min(vehicle2_data)
+                if abs(vehicle1_first_y - vehicle2_first_y) < 5:
+                    common_frames = set(frame for frame, _, _ in vehicle1_data) & set(frame for frame, _, _ in vehicle2_data)
+                    if common_frames:
+                        min_y_diff = min(abs(tracks_by_frame_and_id[frame][vehicle1_id]['y'] - tracks_by_frame_and_id[frame][vehicle2_id]['y']) for frame in common_frames)
+                        if min_y_diff < 3:
+                            if vehicle1_first_x > vehicle2_first_x:
+                                return vehicle1_id, vehicle2_id  # vehicle1 is the cutting-in vehicle, vehicle2 is the ego vehicle
+                            else:
+                                return vehicle2_id, vehicle1_id  # vehicle2 is the cutting-in vehicle, vehicle1 is the ego vehicle
+    print("未找到切入车和本车")
+    return None
+
+def read_tracks_csv(file_path):
+    data = pd.read_csv(file_path)
+    tracks_by_frame_and_id = {}
+    for frame, frame_data in data.groupby('frame'):
+        tracks_by_frame_and_id[frame] = {row['id']: row.to_dict() for _, row in frame_data.iterrows()}
+    return tracks_by_frame_and_id
+
+def process_each_file(file_path, output_file):
+    tracks_by_frame_and_id = read_tracks_csv(file_path)
+    vehicle_ids = identify_vehicles(tracks_by_frame_and_id)
+    if vehicle_ids is not None:
+        find_half_width_proximity_frame(tracks_by_frame_and_id, vehicle_ids, output_file)
+    else:
+        with open(output_file, 'a') as file:
+            file.write(f"No valid vehicle pairs found in {file_path}, skipped further analysis.\n")
+
+def main():
+    file_paths = [
+        "/home/dji/disk1/zhouhang/shuju/CUTIN19_40_15_0__9_16_fail_M3_tracks.csv",
+        "/home/dji/disk1/zhouhang/shuju/CUTIN33_40_5_0__7_23_fail_M3_tracks.csv",
+        "/home/dji/disk1/zhouhang/shuju/CUTIN68_60_35_0__7_18_fail_tracks.csv",
+        "/home/dji/disk1/zhouhang/shuju/CUTIN69_60_35_0__9_16_fail_tracks.csv",
+        "/home/dji/disk1/zhouhang/shuju/CUTIN82_70_45_0__7_14_fail_tracks.csv",
+        "/home/dji/disk1/zhouhang/shuju/CUTIN85_70_45_1_10_fail_M3_tracks.csv",
+        "/home/dji/disk1/zhouhang/shuju/CUTIN86_70_35_0__7_30_fail_tracks.csv"
+    ]
+    output_file = '/home/dji/disk1/zhouhang/shuju/step4.txt'
+    with open(output_file, 'w') as file:
+        file.write("Starting analysis...\n")
+    for file_path in file_paths:
+        process_each_file(file_path, output_file)
+
+if __name__ == "__main__":
+    main()
