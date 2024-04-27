@@ -1,0 +1,59 @@
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+# 读取文件内容
+file_path = '/home/dji/disk1/zhouhang/shuju/merged_output.txt'  # 替换为您的文件路径
+with open(file_path, 'r') as file:
+    lines = file.readlines()
+
+# 解析数据并创建编号映射
+scene_number_mapping = {}
+initial_speeds = []  # 切入车的初始速度
+max_speeds = []  # 本车的最大速度
+cut_in_distances = []  # 切入距离
+mapped_scene_numbers = []
+
+for index, line in enumerate(lines[1:], start=1):  # 跳过标题行，从1开始编号
+    parts = line.strip().split(',')
+    # 提取场景编号，文件名格式为"CUTINXX_..."
+    original_scene_number = int(parts[0].split('_')[1])
+    # 创建映射：原始编号到连续编号
+    scene_number_mapping[original_scene_number] = index
+    
+    # 提取速度和切入距离信息
+    initial_speed = float(parts[2].split(': ')[1])  # 切入车初始速度
+    max_speed = float(parts[3].split(': ')[1])  # 本车最大速度
+    cut_in_distance = float(parts[5].split(': ')[1])  # 切入距离
+    
+    mapped_scene_numbers.append(index)  # 保存映射后的场景编号
+    initial_speeds.append(initial_speed)
+    max_speeds.append(max_speed)
+    cut_in_distances.append(cut_in_distance)
+
+# 创建3D图表
+fig = plt.figure(figsize=(14, 10))
+ax = fig.add_subplot(111, projection='3d')
+
+# 设置视角 (elev=高度角, azim=方位角)
+ax.view_init(elev=20, azim=45)  # 降低视角
+
+# 数据绘制
+for i in range(len(mapped_scene_numbers)):
+    # 绘制更小的点
+    ax.scatter(mapped_scene_numbers[i], cut_in_distances[i], initial_speeds[i], marker='o', s=15, color='green', alpha=0.8, label='Cut-in vehicle speed (km/h)' if i == 0 else "")
+    ax.scatter(mapped_scene_numbers[i], cut_in_distances[i], max_speeds[i], marker='o', s=15, color='blue', alpha=0.8, label='Ego vehicle speed (km/h)' if i == 0 else "")
+    # 连接点
+    ax.plot([mapped_scene_numbers[i], mapped_scene_numbers[i]], [cut_in_distances[i], cut_in_distances[i]], [initial_speeds[i], max_speeds[i]], 'gray', linestyle='--', alpha=0.5)
+
+ax.set_xlabel('Scene number')
+ax.set_ylabel('Cut-in distance (m)')
+ax.set_zlabel('Speed (km/h)')
+ax.set_title('3D view: scene numbering, cut-in distance versus vehicle speed')
+ax.legend()
+
+# 指定图表保存位置
+save_path = '/home/dji/disk1/zhouhang/shuju/3D_speed_distance_plot.png'
+plt.savefig(save_path)
+
+# 显示图表
+plt.show()
